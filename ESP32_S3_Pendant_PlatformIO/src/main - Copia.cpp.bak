@@ -1,0 +1,377 @@
+// ================================================================
+// CNC Pendant - Versione ESP-NOW (PCNT hardware per encoder)
+// ================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "Headers.h"
+#include "ESPNow_Manager.h"
+#include "CNC_Controller.h"
+
+extern Config config;
+extern TwoWire I2Ctwo;
+extern Adafruit_SH1106G xDisplay;
+extern Adafruit_SH1106G zDisplay;
+extern Adafruit_ADS1115 ads;
+extern PCF8575 pcfA;
+extern PCF8575 pcfB;
+extern MachineStatus machine;
+extern InputState input;
+extern QueueHandle_t gcodeQueue;
+extern bool grblReady;
+extern ESPNowManager cnc;
+extern volatile bool g_encoderActive;
+extern volatile bool g_suspendEncoder;   // 🔥 importato
+
+TaskHandle_t TaskMainHandle;
+TaskHandle_t TaskCNCHandle;
+
+// ========== PROTOTIPI ==========
+void IRAM_ATTR handlePCFInterrupt();
+void IRAM_ATTR handleJoystickChange();
+void taskCNC(void* parameter);
+void TaskMain(void* pvParameters);
+void initializeOTAMode();
+void initializeNormalMode();
+bool isJoystickPressed();
+
+// ========== FUNZIONI PER SOSPENDERE/RIPRENDERE GLI INTERRUPT ==========
+void suspendInterrupts() {
+    detachInterrupt(digitalPinToInterrupt(config.pcfIntPin));
+    detachInterrupt(digitalPinToInterrupt(config.joyRight));
+    detachInterrupt(digitalPinToInterrupt(config.joyLeft));
+    detachInterrupt(digitalPinToInterrupt(config.joyDown));
+    detachInterrupt(digitalPinToInterrupt(config.joyUp));
+}
+
+void resumeInterrupts() {
+    attachInterrupt(digitalPinToInterrupt(config.pcfIntPin), handlePCFInterrupt, FALLING);
+    attachInterrupt(digitalPinToInterrupt(config.joyRight), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyLeft), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyDown), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyUp), handleJoystickChange, CHANGE);
+}
+
+// ========== CALLBACK ==========
+void onPositionUpdate(const Position& pos) {
+    machine.wposX = pos.x;
+    machine.wposY = pos.y;
+    machine.wposZ = pos.z;
+    machine.wposA = pos.a;
+}
+
+void onStateChange(MachineState oldState, MachineState newState) {}
+void onError(const String& error) { Serial.println("❌ Errore GRBL: " + error); }
+
+// ========== SCANSIONE CANALE WIFI ==========
+void scanWiFiChannel() {
+    // La scansione del canale viene già eseguita da ESPNowManager::scanChannelFromKnownNetworks()
+}
+
+// ========== CONTROLLO JOYSTICK CON DEBOUNCE ==========
+bool isJoystickPressed() {
+    static unsigned long lastCheck = 0;
+    static bool lastState = false;
+    unsigned long now = millis();
+    if (now - lastCheck < 50) return lastState; // debounce 50ms
+    lastCheck = now;
+
+    bool pressed = (digitalRead(config.joyRight) == LOW ||
+                    digitalRead(config.joyLeft) == LOW ||
+                    digitalRead(config.joyDown) == LOW ||
+                    digitalRead(config.joyUp) == LOW);
+    if (pressed != lastState) {
+        lastState = pressed;
+        if (pressed) Serial.println("🕹️ Joystick premuto!");
+    }
+    return pressed;
+}
+
+// ========== OTA MODE ==========
+void initializeOTAMode() {
+    Serial.println("📡 Avvio modalità OTA...");
+    OTAManager::setup();
+    DisplayManager::showOTAScreen();
+    while (true) {
+        OTAManager::update();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// ========== MODALITÀ NORMALE ==========
+void initializeNormalMode() {
+    Serial.println("🚀 Starting in Normal Mode...");
+
+    // ===== PCF8575 CONFIGURAZIONE =====
+    if (!pcfA.begin()) {
+        Serial.println("❌ PCF8575A Error");
+    } else {
+        Serial.println("✅ PCF8575A OK");
+        for (uint8_t pin = 0; pin <= 7; pin++) {
+            pcfA.write(pin, HIGH);
+        }
+        for (uint8_t pin = 8; pin <= 15; pin++) {
+            pcfA.write(pin, HIGH);
+        }
+    }
+
+    if (!pcfB.begin()) {
+        Serial.println("❌ PCF8575B Error");
+    } else {
+        Serial.println("✅ PCF8575B OK");
+        for (uint8_t pin = 0; pin <= 15; pin++) {
+            pcfB.write(pin, HIGH);
+        }
+    }
+
+    // ===== LED =====
+    LEDManager::initializeLEDs();
+    delay(200);
+
+    // ===== PULSANTI =====
+    ButtonHandler::begin();
+
+    // ===== INTERRUPT PCF8575 =====
+    pinMode(config.pcfIntPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(config.pcfIntPin), handlePCFInterrupt, FALLING);
+
+    // ===== ADS1115 =====
+    InputHandler::initADS1115();
+    attachInterrupt(digitalPinToInterrupt(config.adsIntPin), InputHandler::ads1115AlertISR, FALLING);
+
+    // ===== ENCODER (PCNT) =====
+    InputHandler::setupEncoders();
+
+    // ===== JOYSTICK =====
+    attachInterrupt(digitalPinToInterrupt(config.joyRight), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyLeft), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyDown), handleJoystickChange, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(config.joyUp), handleJoystickChange, CHANGE);
+
+    // ===== DISPLAY =====
+    DisplayManager::begin();
+
+    // ===== MOSTRA PROMPT OTA PER 5 SECOND =====
+    DisplayManager::showOTAPrompt();
+    Serial.println("⏳ Finestra OTA attiva per 5 secondi. Premere joystick per entrare in OTA.");
+    unsigned long otaPromptStart = millis();
+    bool otaRequested = false;
+
+    while (millis() - otaPromptStart < 5000) {
+        if (isJoystickPressed()) {
+            otaRequested = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (otaRequested) {
+        Serial.println("🔄 Joystick premuto! Entro in OTA...");
+        xDisplay.clearDisplay();
+        zDisplay.clearDisplay();
+        DisplayManager::showOTAScreen();
+        OTAManager::setup();
+        while (true) {
+            OTAManager::update();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    } else {
+        Serial.println("⏱️ Nessun joystick premuto, continuo in modalità normale");
+        xDisplay.clearDisplay();
+        zDisplay.clearDisplay();
+        DisplayManager::showWaitController();
+        xDisplay.display();
+        zDisplay.display();
+        delay(100);
+        Serial.println("✅ Schermata di attesa mostrata");
+    }
+
+    // ===== ESP-NOW =====
+    scanWiFiChannel();
+
+    // ===== CODA COMANDI =====
+    if (gcodeQueue == NULL) {
+        gcodeQueue = xQueueCreate(50, sizeof(CNCCommand));
+        if (gcodeQueue == NULL) {
+            Serial.println("❌ Queue creation failed");
+            while (true) delay(1000);
+        }
+    }
+
+    // ===== ESPNowManager =====
+    cnc.onPosition(onPositionUpdate);
+    cnc.onStateChange(onStateChange);
+    cnc.onError(onError);
+
+    bool paired = cnc.begin();
+    machine.cncConnected = paired;
+
+    if (paired) {
+        Serial.println("✅ Pairing con il bridge riuscito");
+        LEDManager::allLEDsOff();
+        CNCController::setup();
+        DisplayManager::showMainScreen();
+    } else {
+        Serial.println("⚠️ Pairing fallito, riproverò in background");
+    }
+
+    // ===== TASK =====
+    xTaskCreatePinnedToCore(taskCNC, "TaskCNC", 8192, NULL, 1, &TaskCNCHandle, 0);
+    xTaskCreatePinnedToCore(TaskMain, "TaskMain", 16384, NULL, 2, &TaskMainHandle, 1);
+
+    grblReady = true;
+    Serial.println("✅ CNC Pendant Ready - Normal Mode");
+}
+
+// ========== SETUP ==========
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n\n🔥 CNC Pendant Starting...");
+    Serial.printf("🔹 Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("🔹 CPU cores: %d\n", ESP.getChipCores());
+
+    I2Ctwo.begin(config.sdaPin, config.sclPin, 400000);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    pinMode(config.joyRight, INPUT_PULLUP);
+    pinMode(config.joyLeft, INPUT_PULLUP);
+    pinMode(config.joyDown, INPUT_PULLUP);
+    pinMode(config.joyUp, INPUT_PULLUP);
+
+    initializeNormalMode();
+}
+
+// ========== TASK CNC (core 0) ==========
+void taskCNC(void* parameter) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    Serial.println("🧠 TaskCNC avviato sul core 0 (ESP-NOW)");
+
+    CNCCommand cmd;
+    unsigned long lastPoll = 0;
+    const unsigned long POLL_INTERVAL = 200;
+
+    while (true) {
+        cnc.update();
+
+        if (!CNCController::AutoReportStatus && cnc.isReady()) {
+            if (millis() - lastPoll >= POLL_INTERVAL) {
+                cnc.sendRealtime('?');
+                lastPoll = millis();
+            }
+        }
+
+        if (gcodeQueue != NULL && xQueueReceive(gcodeQueue, &cmd, 0) == pdPASS) {
+            switch (cmd.type) {
+                case CMD_GCODE:
+                    cnc.sendCommand(String(cmd.gcode));
+                    break;
+                case CMD_JOG:
+                    CNCController::sendJogCommand(String(cmd.axis), cmd.distance, cmd.feedrate);
+                    break;
+                case CMD_JOGCANCEL:
+                    CNCController::sendJogCancel();
+                    break;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
+// ========== TASK PRINCIPALE (core 1) ==========
+void TaskMain(void* pvParameters) {
+    Serial.println("🧠 TaskMain avviato sul core 1 (UI/Input)");
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    static bool encoderActive = false;
+    static unsigned long encoderActiveTime = 0;
+    static int lastX = 0, lastZ = 0;
+    static bool interruptsSuspended = false;
+    static unsigned long lastPairingMsg = 0;
+
+    for (;;) {
+        unsigned long now = millis();
+
+        // 🔥 Se la lettura è sospesa, non leggere il PCNT e non processare movimenti
+        if (!g_suspendEncoder) {
+            int currentX = InputHandler::getPCNT_X();
+            int currentZ = InputHandler::getPCNT_Z();
+
+            if ((currentX != lastX || currentZ != lastZ) && !ButtonHandler::areEncodersLocked()) {
+                if (!encoderActive) {
+                    encoderActive = true;
+                    g_encoderActive = true;
+                    if (!interruptsSuspended) {
+                        suspendInterrupts();
+                        interruptsSuspended = true;
+                    }
+                }
+                encoderActiveTime = now;
+                InputHandler::handleEncoderJog();
+                lastX = currentX;
+                lastZ = currentZ;
+            }
+        }
+
+        if (encoderActive && (now - encoderActiveTime < 250)) {
+            taskYIELD();
+            continue;
+        } else {
+            if (encoderActive) {
+                g_encoderActive = false;
+                encoderActive = false;
+                if (interruptsSuspended) {
+                    resumeInterrupts();
+                    interruptsSuspended = false;
+                }
+                InputHandler::processPendingDebug();
+            }
+        }
+
+        InputHandler::handleJoystick();
+        InputHandler::handleButtons();
+
+        static unsigned long lastDisplayUpdate = 0;
+        static unsigned long lastSafetyUpdate = 0;
+        if (now - lastDisplayUpdate >= 200) {
+            lastDisplayUpdate = now;
+            DisplayManager::update();
+        }
+        if (now - lastSafetyUpdate >= 200) {
+            lastSafetyUpdate = now;
+            SafetyManager::update();
+            LEDManager::setZeroLEDsOff();
+            LEDManager::updateGotoLEDs();
+        }
+
+        static unsigned long lastADSUpdate = 0;
+        if (now - lastADSUpdate >= 200) {
+            lastADSUpdate = now;
+            InputHandler::handleADS1115();
+        }
+
+        if (!cnc.isReady()) {
+            if (now - lastPairingMsg > 5000) {
+                lastPairingMsg = now;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// ========== INTERRUPT ==========
+void IRAM_ATTR handlePCFInterrupt() {
+    input.interruptFlag = true;
+}
+void IRAM_ATTR handleJoystickChange() {
+    InputHandler::readJoystickState();
+}
+
+// ========== LOOP ==========
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
